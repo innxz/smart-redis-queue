@@ -68,8 +68,23 @@ local function ensureGroup(group)
 	end
 end
 
+-- hot: порог приоритета (SetHotPriority). Партиция с задачей не ниже порога
+-- попадает в group:{g}:hot — Get берёт такие партиции группы раньше остальных.
+-- score = самое раннее время, когда hot-задачу партиции можно взять (ms):
+-- меньший score не перезаписывается большим (без ZADD LT — он с Redis 6.2).
+local hotPrio = tonumber(redis.call('GET', "queue:" .. queueName .. ":hot_priority") or "") or 0
+local function markHot(group, partitionCode, priority, scheduled)
+	if hotPrio > 0 and (tonumber(priority) or 0) >= hotPrio then
+		local hotKey = "queue:" .. queueName .. ":group:" .. group .. ":hot"
+		local cur = redis.call('ZSCORE', hotKey, partitionCode)
+		if cur == false or scheduled < tonumber(cur) then
+			redis.call('ZADD', hotKey, scheduled, partitionCode)
+		end
+	end
+end
+
 -- Поднять partition в ready всех её групп (после ZADD задачи).
-local function ensurePartitionReady(partitionCode)
+local function ensurePartitionReady(partitionCode, priority, scheduled)
 	local partGroupsKey = "queue:" .. queueName .. ":partition:" .. partitionCode .. ":groups"
 	local pgroups = redis.call('SMEMBERS', partGroupsKey)
 	if #pgroups == 0 then
@@ -80,6 +95,7 @@ local function ensurePartitionReady(partitionCode)
 		local g = pgroups[gi]
 		ensureGroup(g)
 		redis.call('ZADD', "queue:" .. queueName .. ":group:" .. g .. ":ready", 0, partitionCode)
+		markHot(g, partitionCode, priority, scheduled)
 	end
 end
 
@@ -140,6 +156,7 @@ for i = 0, taskCount - 1 do
 					hasGroup = true
 					ensureGroup(group)
 					redis.call('ZADD', "queue:" .. queueName .. ":group:" .. group .. ":ready", 0, partitionCode)
+					markHot(group, partitionCode, priority, scheduled)
 					redis.call('SADD', partGroupsKey, group)
 				end
 			end
@@ -147,6 +164,7 @@ for i = 0, taskCount - 1 do
 		if not hasGroup then
 			ensureGroup("_default")
 			redis.call('ZADD', "queue:" .. queueName .. ":group:_default:ready", 0, partitionCode)
+			markHot("_default", partitionCode, priority, scheduled)
 			redis.call('SADD', partGroupsKey, "_default")
 		end
     elseif isDebounce then
@@ -177,7 +195,7 @@ for i = 0, taskCount - 1 do
 			redis.call('SADD', partitionsKey, partitionCode)
 			local prioritiesKey = "queue:" .. queueName .. ":partition:" .. partitionCode .. ":priorities"
 			redis.call('ZADD', prioritiesKey, priority, priority)
-			ensurePartitionReady(partitionCode)
+			ensurePartitionReady(partitionCode, priority, scheduled)
 			redis.call('DEL', debounceKey)
 		else
 			-- in-flight: только payload + флаг until (без ZADD)
@@ -286,6 +304,9 @@ local partitionsKey = "queue:" .. queueName .. ":partitions"
 local consumersKey = "queue:" .. queueName .. ":consumers"
 local consumerKey = "queue:" .. queueName .. ":consumer:" .. consumerId
 local consumerTasksKey = "queue:" .. queueName .. ":consumer:" .. consumerId .. ":tasks"
+
+-- hot: порог приоритета (SetHotPriority); 0 — выключено, обход как раньше.
+local hotPrio = tonumber(redis.call('GET', "queue:" .. queueName .. ":hot_priority") or "") or 0
 
 local acquiredPartitionLocks = {}
 local partitionHadTask = {}
@@ -532,6 +553,7 @@ local function removePartitionFromIndexes(partition)
 	local pgroups = redis.call('SMEMBERS', "queue:" .. queueName .. ":partition:" .. partition .. ":groups")
 	for gi = 1, #pgroups do
 		local g = pgroups[gi]
+		redis.call('ZREM', "queue:" .. queueName .. ":group:" .. g .. ":hot", partition)
 		local readyKey = "queue:" .. queueName .. ":group:" .. g .. ":ready"
 		redis.call('ZREM', readyKey, partition)
 		if redis.call('ZCARD', readyKey) == 0 then
@@ -659,8 +681,81 @@ end
 -- Группа, из которой взята последняя задача collectOne (нужна добору samePartition для RL group-слоя).
 local lastCollectedGroup = nil
 
+-- hot = ZSET партиций группы, где есть задача с priority >= hotPrio; score — самое
+-- раннее время (ms), когда такую задачу можно взять. Get смотрит только score <= now,
+-- тем же random start по кругу, не больше 256 партиций за вызов. Уборка ленивая:
+-- нет hot-задач → ZREM; голова hot-уровней в будущем или ordered-партиция на паузе
+-- (blocked) → score сдвигается на это время (ZADD XX), до него партиция не смотрится.
+local function hotHeadScore(partition)
+	local levels = redis.call('ZREVRANGEBYSCORE', "queue:" .. queueName .. ":partition:" .. partition .. ":priorities", '+inf', hotPrio)
+	local head = nil
+	for li = 1, #levels do
+		local t = redis.call('ZRANGE', "queue:" .. queueName .. ":partition:" .. partition .. ":" .. levels[li], 0, 0, 'WITHSCORES')
+		if #t >= 2 then
+			local sc = tonumber(t[2])
+			if head == nil or sc < head then
+				head = sc
+			end
+		end
+	end
+	return head
+end
+
+local function tryHotGroup(g)
+	local hotKey = "queue:" .. queueName .. ":group:" .. g .. ":hot"
+	local n = redis.call('ZCOUNT', hotKey, '-inf', now)
+	if n == 0 then
+		return nil
+	end
+	local take = math.min(n, 256)
+	local start = math.random(0, n - 1)
+	local parts
+	if start + take <= n then
+		parts = redis.call('ZRANGEBYSCORE', hotKey, '-inf', now, 'LIMIT', start, take)
+	else
+		parts = redis.call('ZRANGEBYSCORE', hotKey, '-inf', now, 'LIMIT', start, n - start)
+		local rest = redis.call('ZRANGEBYSCORE', hotKey, '-inf', now, 'LIMIT', 0, take - (n - start))
+		for ri = 1, #rest do
+			parts[#parts + 1] = rest[ri]
+		end
+	end
+	for i = 1, #parts do
+		local partition = parts[i]
+		local head = hotHeadScore(partition)
+		if head == nil then
+			redis.call('ZREM', hotKey, partition)
+		elseif head > now then
+			redis.call('ZADD', hotKey, 'XX', head, partition)
+		elseif blockedParts[partition] then
+			local unlockAt = tonumber(redis.call('ZSCORE', blockedKey, partition))
+			if unlockAt and unlockAt > now then
+				redis.call('ZADD', hotKey, 'XX', unlockAt, partition)
+			end
+		else
+			local taskData = tryCollectFromPartition(partition, g)
+			if taskData then
+				lastCollectedGroup = g
+				return taskData
+			end
+			if blockedGroups[g] then
+				return nil
+			end
+		end
+	end
+	return nil
+end
+
 -- ready = ZSET (score=0). Random start index → ZRANGE батчами по кругу. Память O(batch).
 local function tryReadyGroup(g)
+	if hotPrio > 0 then
+		local hotTask = tryHotGroup(g)
+		if hotTask then
+			return hotTask
+		end
+		if blockedGroups[g] then
+			return nil
+		end
+	end
 	local readyKey = "queue:" .. queueName .. ":group:" .. g .. ":ready"
 	local n = redis.call('ZCARD', readyKey)
 	if n == 0 then
@@ -979,12 +1074,21 @@ if #pgroups == 0 then
 	pgroups = {"_default"}
 	redis.call('SADD', "queue:" .. queueName .. ":partition:" .. partitionCode .. ":groups", "_default")
 end
+local hotPrio = tonumber(redis.call('GET', "queue:" .. queueName .. ":hot_priority") or "") or 0
 for gi = 1, #pgroups do
 	local g = pgroups[gi]
 	if not redis.call('ZSCORE', groupsKey, g) then
 		redis.call('ZADD', groupsKey, 0, g)
 	end
 	redis.call('ZADD', "queue:" .. queueName .. ":group:" .. g .. ":ready", 0, partitionCode)
+	if hotPrio > 0 and priority >= hotPrio then
+		-- score = исходный score задачи; пауза ordered-партиции (blocked) учтётся в Get
+		local hotKey = "queue:" .. queueName .. ":group:" .. g .. ":hot"
+		local cur = redis.call('ZSCORE', hotKey, partitionCode)
+		if cur == false or score < tonumber(cur) then
+			redis.call('ZADD', hotKey, score, partitionCode)
+		end
+	end
 end
 
 -- :count / :lock только для ordered (!)
@@ -1121,6 +1225,9 @@ for i = 1, #consumers do
 		local partitionsKey = "queue:" .. queueName .. ":partitions"
 		local restoredParts = {}
 		local partPriorities = {}
+		-- hot: min score hot-задач партиции (SetHotPriority); nil — партиция не hot
+		local hotPrio = tonumber(redis.call('GET', "queue:" .. queueName .. ":hot_priority") or "") or 0
+		local partHotScore = {}
 
 		for j = 1, #tasksData, 2 do
 			local taskToReturn = tasksData[j]
@@ -1160,6 +1267,12 @@ for i = 1, #consumers do
 				end
 
 				restoredParts[taskPartition] = true
+				if hotPrio > 0 and taskPriority >= hotPrio then
+					local hs = partHotScore[taskPartition]
+					if hs == nil or score < hs then
+						partHotScore[taskPartition] = score
+					end
+				end
 				if not partPriorities[taskPartition] then
 					partPriorities[taskPartition] = {}
 				end
@@ -1173,6 +1286,7 @@ for i = 1, #consumers do
 			for prioStr, prioNum in pairs(partPriorities[part]) do
 				redis.call('ZADD', prioritiesKey, prioNum, prioStr)
 			end
+			local hotScore = partHotScore[part]
 
 			local pgroups = redis.call('SMEMBERS', "queue:" .. queueName .. ":partition:" .. part .. ":groups")
 			if #pgroups == 0 then
@@ -1185,6 +1299,13 @@ for i = 1, #consumers do
 					redis.call('ZADD', groupsKey, 0, g)
 				end
 				redis.call('ZADD', "queue:" .. queueName .. ":group:" .. g .. ":ready", 0, part)
+				if hotScore ~= nil then
+					local hotKey = "queue:" .. queueName .. ":group:" .. g .. ":hot"
+					local cur = redis.call('ZSCORE', hotKey, part)
+					if cur == false or hotScore < tonumber(cur) then
+						redis.call('ZADD', hotKey, hotScore, part)
+					end
+				end
 			end
 
 			if part:sub(1, 1) == "!" then
